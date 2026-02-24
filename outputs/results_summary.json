@@ -1,0 +1,41 @@
+{
+  "model": {
+    "backbone": "EfficientNetB0",
+    "num_classes": 6,
+    "total_params": 4379049
+  },
+  "dataset": {
+    "total": 1894,
+    "train": 1325,
+    "val": 284,
+    "test": 285,
+    "class_counts": {
+      "goal": 546,
+      "goal_attempt": 153,
+      "free_kick": 300,
+      "offside": 75,
+      "card": 144,
+      "normal_play": 676
+    }
+  },
+  "test_metrics": {
+    "accuracy": 0.5298245614035088,
+    "weighted_f1": 0.5303022210367138,
+    "per_class_f1": {
+      "goal": 0.5507246376811594,
+      "goal_attempt": 0.5517241379310345,
+      "free_kick": 0.48598130841121495,
+      "offside": 0.47058823529411764,
+      "card": 0.5797101449275363,
+      "normal_play": 0.524390243902439
+    },
+    "goal_accuracy_met": false,
+    "goal_f1_met": false
+  },
+  "baseline": {
+    "majority_accuracy": 0.35789473684210527,
+    "majority_f1": 0.1886576907384741,
+    "random_accuracy": 0.23508771929824562,
+    "random_f1": 0.23279939730594695
+  }
+}
