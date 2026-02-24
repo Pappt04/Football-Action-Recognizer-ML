@@ -1,17 +1,17 @@
 Soccer Action Recognition
 =======================================================
-Accuracy:    52.98%
-Weighted F1: 0.5303
+Accuracy:    81.25%
+Weighted F1: 0.8133
 
               precision    recall  f1-score   support
 
-        goal     0.6786    0.4634    0.5507        82
-goal_attempt     0.4571    0.6957    0.5517        23
-   free_kick     0.4194    0.5778    0.4860        45
-     offside     0.3478    0.7273    0.4706        11
-        card     0.4255    0.9091    0.5797        22
- normal_play     0.6935    0.4216    0.5244       102
+        goal     0.7561    0.8706    0.8093       819
+goal_attempt     0.8592    0.7991    0.8281       229
+   free_kick     0.7413    0.7578    0.7495       450
+     offside     0.9223    0.8482    0.8837       112
+        card     0.9651    0.7650    0.8535       217
+ normal_play     0.8528    0.7990    0.8250      1015
 
-    accuracy                         0.5298       285
-   macro avg     0.5037    0.6325    0.5272       285
-weighted avg     0.5928    0.5298    0.5303       285
+    accuracy                         0.8125      2842
+   macro avg     0.8495    0.8066    0.8248      2842
+weighted avg     0.8191    0.8125    0.8133      2842

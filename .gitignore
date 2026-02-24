@@ -1,0 +1,16 @@
+activate_env.sh
+
+# Dataset — prevelik za GitHub (1.7 GB), skinuti sa Kaggle
+data/
+
+# Virtuelno okruženje
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store

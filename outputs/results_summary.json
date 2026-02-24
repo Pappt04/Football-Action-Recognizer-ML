@@ -5,37 +5,37 @@
     "total_params": 4379049
   },
   "dataset": {
-    "total": 1894,
-    "train": 1325,
-    "val": 284,
-    "test": 285,
+    "total": 18943,
+    "train": 13259,
+    "val": 2842,
+    "test": 2842,
     "class_counts": {
-      "goal": 546,
-      "goal_attempt": 153,
-      "free_kick": 300,
-      "offside": 75,
-      "card": 144,
-      "normal_play": 676
+      "goal": 5461,
+      "goal_attempt": 1527,
+      "free_kick": 3001,
+      "offside": 746,
+      "card": 1445,
+      "normal_play": 6763
     }
   },
   "test_metrics": {
-    "accuracy": 0.5298245614035088,
-    "weighted_f1": 0.5303022210367138,
+    "accuracy": 0.8124560168895144,
+    "weighted_f1": 0.8132585337742396,
     "per_class_f1": {
-      "goal": 0.5507246376811594,
-      "goal_attempt": 0.5517241379310345,
-      "free_kick": 0.48598130841121495,
-      "offside": 0.47058823529411764,
-      "card": 0.5797101449275363,
-      "normal_play": 0.524390243902439
+      "goal": 0.8093076049943246,
+      "goal_attempt": 0.8280542986425339,
+      "free_kick": 0.7494505494505495,
+      "offside": 0.8837209302325582,
+      "card": 0.8534704370179949,
+      "normal_play": 0.8250254323499492
     },
-    "goal_accuracy_met": false,
-    "goal_f1_met": false
+    "goal_accuracy_met": true,
+    "goal_f1_met": true
   },
   "baseline": {
-    "majority_accuracy": 0.35789473684210527,
-    "majority_f1": 0.1886576907384741,
-    "random_accuracy": 0.23508771929824562,
-    "random_f1": 0.23279939730594695
+    "majority_accuracy": 0.35714285714285715,
+    "majority_f1": 0.18796992481203006,
+    "random_accuracy": 0.25193525686136525,
+    "random_f1": 0.2511679501941274
   }
 }

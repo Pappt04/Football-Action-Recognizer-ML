@@ -1,0 +1,78 @@
+Automatsko prepoznavanje sportskih akcija iz video snimaka
+
+1. Tim
+Stefan Paunović RA 27/2022 i Tamás Papp RA 4/2022.
+
+2. Asistent
+Teodor Vidaković.
+
+3. Definicija problema
+Automatsko prepoznavanje i klasifikacija sportskih akcija u fudbalskim utakmicama na osnovu video snimaka i slika. Sistem prima kadar (frame) ili kratak video klip kao ulaz i klasifikuje ga u jednu od sledećih kategorija akcija: gol, faul, slobodnjak, korner, ofsajd ili normalna igra. Cilj je razviti model koji može da prepozna ključne događaje u toku utakmice u realnom vremenu.
+
+4. Motivacija problema
+Automatska analiza sportskog videa je aktivan istraživački problem koji ima direktnu industrijsku primenu:
+
+    • Automatsko generisanje highlight reela - sistem automatski identifikuje i iseca najzanimljivije momente utakmice (golovi, fauli) bez manuelnog rada editora.
+    • Sportska analitika u realnom vremenu - TV emitovanje i sportski klupovi mogu dobijati instant statističku analizu akcija tokom utakmice.
+    • VAR sistemi nove generacije - pomoć sudijama automatskim prepoznavanjem potencijalno spornih situacija iz kamere.
+    • Video indeksiranje i pretraga - platforme kao što su YouTube Sport ili DAZN mogu automatski tagirati sadržaj i omogućiti pretragu po tipu akcije.
+
+5. Skup podataka
+Koristićemo SoccerNet dataset, koji je javno dostupan za akademske svrhe:
+
+Link: https://www.soccer-net.org/data
+
+Dataset sadrži 500+ fudbalskih utakmica iz top evropskih liga sa vremenski anotiranim događajima. Za potrebe ovog projekta, iz video snimaka ćemo ekstrahovati:
+
+    • Frame-ove oko anotiranih događaja - uzimamo kadrove u trenutku akcije i 1 sekund pre/posle kao kontekst.
+    • Negativne primere - nasumično uzorkovani kadrovi iz perioda normalne igre kao klasa 'normalna igra'.
+
+Frejmovi koji ne pripadaju nijednoj od 6 definisanih klasa akcija (npr. pauze u igri, kadrovi tribina, poluvremenska analiza) biće automatski isključeni iz dataseta tokom faze ekstrakcije. Kriterijum isključivanja: kadrovi van vremenskog prozora od ±2 sekunde oko anotiranih događaja, koji nisu ni deo uzorkovanog skupa 'normalna igra', neće ući u trening ni evaluacioni skup. Ovaj korak čistoće podataka je ključan za kvalitet modela.
+
+Planirani broj slika po klasi: ~500-1000 slika, ukupno ~4000-6000 slika za 6 klasa. Dodatno, kao dopuna, koristićemo i:
+
+Link: https://www.kaggle.com/datasets/saberghaderi/-dfl-bundesliga-460-mp4-videos-in-30sec-csv
+
+6. Metodologija
+Problem tretiramo kao zadatak klasifikacije slika sa 6 klasa. Pipeline obrade podataka i treniranja modela:
+
+6.1 Predobrada slika
+    1. Ekstrakcija frejmova - iz video klipova OpenCV bibliotekom, uzimanje ključnih kadrova oko anotiranih vremena.
+    2. Resize - sve slike skaliramo na 224x224 piksela (standardna veličina za ImageNet modele).
+    3. Normalizacija - vrednosti piksela normalizujemo na [0, 1], zatim standardizujemo po ImageNet mean/std vrednostima (za transfer learning).
+    4. Data augmentation - nasumično horizontalno flippovanje, rotacija ±10°, promene u osvetljenosti i kontrastu kako bi se povećala raznolikost trening skupa i smanjio overfitting.
+
+6.2 Arhitektura modela
+Koristićemo transfer learning pristup. Osnova modela je pretrenirana konvoluciona neuronska mreža (CNN) sa ImageNet weightovima, na koju dodajemo custom klasifikacioni sloj:
+
+    • Backbone: EfficientNetB0 - efikasna CNN arhitektura, dobar balans između brzine i tačnosti.
+    • Global Average Pooling sloj - redukuje feature mape na 1D vektor.
+    • Dense sloj (256 neurona, ReLU aktivacija) - uči reprezentacije specifične za sport.
+    • Dropout (0.5) - regularizacija protiv overfittinga.
+    • Izlazni sloj (6 neurona, Softmax aktivacija) - verovatnoće za svaku od 6 klasa.
+
+Kao loss funkciju koristićemo Categorical Crossentropy, koja je standardni i optimalan izbor za multi-klasnu klasifikaciju sa Softmax izlaznim slojem. Za razliku od Mean Absolute Error (MAE), Categorical Crossentropy direktno optimizuje verovatnoćne distribucije po klasama i strogo kažnjava pogrešne predikcije sa visokom sigurnošću, što vodi ka bolje kalibriranom modelu. Optimizer: Adam sa početnom stopom učenja 1e-4 (fine-tuning faza: 1e-5).
+
+Treniranje u dve faze: prvo zamrzavamo backbone i treniramo samo klasifikator (10 epoha), zatim odmrzavamo poslednjih nekoliko blokova backbone-a i fine-tunujemo ceo model nižom stopom učenja (20 epoha).
+
+6.3 Alternativni pristup — video klasifikacija
+Kao proširenje, istražićemo 3D CNN ili LSTM pristup koji umesto jednog frejma prima sekvencu od 16 uzastopnih frejmova (0.5s klipa), čime model može da uči i temporalne obrasce pokreta karakteristične za svaku akciju.
+
+7. Evaluacija
+Podela dataseta: 70% trening, 15% validacija, 15% test. Stratifikovana podela osigurava balansiranu zastupljenost klasa u svakom skupu.
+
+Primarna metrika evaluacije je weighted F1-score, koji uzima u obzir neuravnoteženu distribuciju klasa (golovi i ofsajdi su znatno ređi od normalne igre). Pored toga, pratimo sledeće metrike:
+
+    • Weighted F1-score - primarna metrika; harmonijska sredina preciznosti i odziva, ponderisana brojem primera po klasi (cilj: > 0.72).
+    • Top-1 Accuracy - procenat tačno klasifikovanih slika (cilj: > 75%).
+    • Per-klasa F1-score - posebno važno za retke klase poput ofsajda kako bismo detektovali da model nije naučio da ih prepoznaje.
+    • Confusion matrix - vizualizacija koji tipovi akcija se međusobno brkaju (npr. slobodnjak vs. korner).
+    • Grad-CAM vizualizacija - prikaz koji delovi slike su bili ključni za odluku modela, kao interpretabilna analiza.
+
+Kao baseline koristimo model koji uvek predviđa najčešću klasu (normalna igra), koji tipično postiže ~40-50% accuracy zbog neravnomerne distribucije klasa.
+
+8. Očekivani izazovi
+    • Neravnomerna distribucija klasa - golovi i ofsajdi su mnogo ređi od normalne igre; koristićemo class weights ili oversampling (SMOTE na feature vektorima).
+    • Vizuelna sličnost akcija - slobodnjak i korner često izgledaju slično na jednom frejmu; temporalni kontekst je ključan.
+    • Varijabilnost snimanja - različiti uglovi kamera, rezolucije i osvetljenja između stadiuma i liga.
+    • Ekstrakcija i labelovanje podataka - manuelna provera anotacija iz SoccerNet dataseta i priprema balansiranog skupa slika.
