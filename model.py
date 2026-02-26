@@ -5,8 +5,6 @@ def build_action_recognizer(
     input_shape: tuple[int, int, int] = (224, 224, 3), num_classes: int = 6
 ) -> tuple[tf.keras.Model, tf.keras.Model]:
     """
-    Builds and returns the EfficientNetB0 transfer learning model.
-
     Architecture:
         Input → EfficientNetB0 (frozen) → GlobalAvgPool → Dense(256) → Dropout(0.5) → Dense(6)
 
@@ -27,14 +25,13 @@ def build_action_recognizer(
     inputs = tf.keras.Input(shape=input_shape, name="input")
 
     # ── Backbone: EfficientNetB0 pretrained on ImageNet ────────────────────
-    # include_preprocessing=False: we handle normalization in the data pipeline
     backbone = tf.keras.applications.EfficientNetB0(
         include_top=False,
         weights="imagenet",
         input_shape=input_shape,
         include_preprocessing=False,
     )
-    backbone.trainable = False  # Frozen during Phase 1
+    backbone.trainable = False
 
     x = backbone(inputs, training=False)
 
@@ -42,7 +39,11 @@ def build_action_recognizer(
     x = tf.keras.layers.GlobalAveragePooling2D(name="gap")(x)
     x = tf.keras.layers.Dense(256, activation="relu", name="dense_256")(x)
     x = tf.keras.layers.Dropout(0.5, name="dropout")(x)
-    outputs = tf.keras.layers.Dense(num_classes, activation="softmax", name="predictions")(x)
+    outputs = tf.keras.layers.Dense(
+        num_classes, activation="softmax", name="predictions"
+    )(x)
 
-    model = tf.keras.Model(inputs=inputs, outputs=outputs, name="football_action_recognizer")
+    model = tf.keras.Model(
+        inputs=inputs, outputs=outputs, name="football_action_recognizer"
+    )
     return model, backbone

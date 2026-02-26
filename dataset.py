@@ -3,17 +3,15 @@ import cv2
 import tensorflow as tf
 from typing import Tuple
 
-# ImageNet Mean and Std as required by the specification
 IMAGENET_MEAN = tf.constant([0.485, 0.456, 0.406], dtype=tf.float32)
 IMAGENET_STD = tf.constant([0.229, 0.224, 0.225], dtype=tf.float32)
 
 
 def get_train_augmentation() -> tf.keras.Sequential:
-    """Returns Keras sequential model for data augmentation."""
     return tf.keras.Sequential(
         [
             tf.keras.layers.RandomFlip("horizontal"),
-            tf.keras.layers.RandomRotation(factor=10.0 / 360.0),  # ±10 degrees
+            tf.keras.layers.RandomRotation(factor=10.0 / 360.0),
             tf.keras.layers.RandomContrast(0.2),
             tf.keras.layers.RandomBrightness(0.2),
         ],
@@ -23,13 +21,10 @@ def get_train_augmentation() -> tf.keras.Sequential:
 
 def preprocess_image(image: tf.Tensor, label: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
     """Resizes, normalizes and standardizes image for transfer learning."""
-    # Resize to 224x224
     image = tf.image.resize(image, [224, 224])
 
-    # Normalize to [0, 1]
     image = image / 255.0
 
-    # Standardize by ImageNet mean and std
     image = (image - IMAGENET_MEAN) / IMAGENET_STD
 
     return image, label
@@ -38,12 +33,7 @@ def preprocess_image(image: tf.Tensor, label: tf.Tensor) -> Tuple[tf.Tensor, tf.
 def load_dataset(
     data_dir: str, batch_size: int = 32, is_training: bool = True
 ) -> tf.data.Dataset:
-    """
-    Loads dataset from directory, applies preprocessing and augmentation.
-    Directory should contain subfolders for each class (e.g. goal, foul, normal).
-    """
     if not os.path.exists(data_dir):
-        # Create a dummy dataset for code checking since the real data is not guaranteed here.
         print(
             f"Warning: Data directory {data_dir} does not exist. Please setup dataset."
         )
@@ -58,10 +48,8 @@ def load_dataset(
         shuffle=is_training,
     )
 
-    # 1. Map preprocessing (Resize + Normalization + Standardization)
     dataset = dataset.map(preprocess_image, num_parallel_calls=tf.data.AUTOTUNE)
 
-    # 2. Map data augmentation only if it's training data
     if is_training:
         aug_model = get_train_augmentation()
         dataset = dataset.map(
@@ -79,10 +67,6 @@ def extract_frames_from_video(
     class_name: str,
     window_sec: float = 1.0,
 ) -> None:
-    """
-    Basic implementation of frame extraction from videos.
-    Takes frames around the `event_time_sec` with a given `window_sec` duration (±1 second typically).
-    """
     if not os.path.exists(video_path):
         print(f"Video {video_path} not found.")
         return
@@ -106,8 +90,6 @@ def extract_frames_from_video(
         if not ret:
             break
 
-        # Save every Nth frame to avoid too many similar frames (e.g., 5 fps sample rate)
-        # fps / 5 means if video is 25 fps, we sample every 5th frame
         sample_step = max(1, int(fps / 5))
         if current_frame % sample_step == 0:
             frame_filename = os.path.join(
