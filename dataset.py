@@ -1,63 +1,104 @@
 import os
 import cv2
-import tensorflow as tf
-from typing import Tuple
+import numpy as np
+from PIL import Image
+from typing import List, Tuple
 
-IMAGENET_MEAN = tf.constant([0.485, 0.456, 0.406], dtype=tf.float32)
-IMAGENET_STD = tf.constant([0.229, 0.224, 0.225], dtype=tf.float32)
+import torch
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as T
+
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
-def get_train_augmentation() -> tf.keras.Sequential:
-    return tf.keras.Sequential(
+def get_train_transforms() -> T.Compose:
+    return T.Compose(
         [
-            tf.keras.layers.RandomFlip("horizontal"),
-            tf.keras.layers.RandomRotation(factor=10.0 / 360.0),
-            tf.keras.layers.RandomContrast(0.2),
-            tf.keras.layers.RandomBrightness(0.2),
-        ],
-        name="data_augmentation",
+            T.Resize((224, 224)),
+            T.RandomHorizontalFlip(),
+            T.RandomRotation(degrees=10),
+            T.ColorJitter(brightness=0.2, contrast=0.2),
+            T.RandomResizedCrop(224, scale=(0.8, 1.0)),
+            T.ToTensor(),
+            T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ]
     )
 
 
-def preprocess_image(image: tf.Tensor, label: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
-    """Resizes, normalizes and standardizes image for transfer learning."""
-    image = tf.image.resize(image, [224, 224])
+def get_val_transforms() -> T.Compose:
+    return T.Compose(
+        [
+            T.Resize((224, 224)),
+            T.ToTensor(),
+            T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ]
+    )
 
-    image = image / 255.0
 
-    image = (image - IMAGENET_MEAN) / IMAGENET_STD
+class FootballDataset(Dataset):
+    """PyTorch Dataset for football action images."""
 
-    return image, label
+    def __init__(
+        self,
+        image_paths: List[str],
+        labels: List[int],
+        transform: T.Compose = None,
+    ):
+        self.image_paths = image_paths
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.image_paths)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        img = Image.open(self.image_paths[idx]).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return img, self.labels[idx]
 
 
 def load_dataset(
-    data_dir: str, batch_size: int = 32, is_training: bool = True
-) -> tf.data.Dataset:
+    data_dir: str,
+    batch_size: int = 32,
+    is_training: bool = True,
+) -> DataLoader:
+    """
+    Build a DataLoader from a directory of class-labelled sub-folders.
+    Expects structure:  data_dir/<class_name>/<image_files>
+    """
     if not os.path.exists(data_dir):
         print(
             f"Warning: Data directory {data_dir} does not exist. Please setup dataset."
         )
-        return tf.data.Dataset.from_tensor_slices([])
+        return DataLoader(FootballDataset([], [], None))
 
-    dataset = tf.keras.utils.image_dataset_from_directory(
-        data_dir,
-        labels="inferred",
-        label_mode="categorical",
-        batch_size=batch_size,
-        image_size=(224, 224),
-        shuffle=is_training,
+    transform = get_train_transforms() if is_training else get_val_transforms()
+
+    image_paths: List[str] = []
+    labels: List[int] = []
+    class_names = sorted(
+        d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))
     )
+    class_to_idx = {name: idx for idx, name in enumerate(class_names)}
 
-    dataset = dataset.map(preprocess_image, num_parallel_calls=tf.data.AUTOTUNE)
+    valid_ext = {".jpg", ".jpeg", ".png", ".bmp"}
+    for class_name in class_names:
+        class_dir = os.path.join(data_dir, class_name)
+        for fname in os.listdir(class_dir):
+            if os.path.splitext(fname)[1].lower() in valid_ext:
+                image_paths.append(os.path.join(class_dir, fname))
+                labels.append(class_to_idx[class_name])
 
-    if is_training:
-        aug_model = get_train_augmentation()
-        dataset = dataset.map(
-            lambda x, y: (aug_model(x, training=True), y),
-            num_parallel_calls=tf.data.AUTOTUNE,
-        )
-
-    return dataset.prefetch(tf.data.AUTOTUNE)
+    dataset = FootballDataset(image_paths, labels, transform)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=is_training,
+        num_workers=4,
+        pin_memory=torch.cuda.is_available(),
+    )
 
 
 def extract_frames_from_video(

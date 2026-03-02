@@ -6,7 +6,7 @@ Asistent: Teodor Vidaković
 Pokretanje:
     source venv/bin/activate
     python main.py           # puno treniranje (~5-7h na CPU)
-    python main.py --quick   # 10% podataka, 2 epohe (~10 min na CPU)
+    python main.py --quick   # 5% podataka, 2+1 epohe (~5 min na CPU)
 
 Dataset struktura:
     data/soccer_events/Dataset/EventClasses/
@@ -26,11 +26,16 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import cv2
 from pathlib import Path
+from PIL import Image
 from tqdm import tqdm
 
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import torchvision.transforms as T
+from torchvision.models import EfficientNet_B0_Weights
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
@@ -43,28 +48,34 @@ from sklearn.metrics import (
 )
 from sklearn.utils.class_weight import compute_class_weight
 
+from dataset import FootballDataset, get_train_transforms, get_val_transforms
+from model import FootballActionRecognizer
+
 warnings.filterwarnings("ignore")
 
 
-class FocalLoss(tf.keras.losses.Loss):
+class FocalLoss(nn.Module):
     """Focal Loss: FL(p_t) = -(1 - p_t)^γ · log(p_t)"""
 
-    def __init__(self, gamma: float = 2.0, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, gamma: float = 2.0, weight: torch.Tensor = None):
+        super().__init__()
         self.gamma = gamma
+        self.register_buffer("weight", weight)
 
-    def call(self, y_true, y_pred):
-        y_true = tf.cast(tf.reshape(y_true, [-1]), tf.int32)
-        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
-        n_cls = tf.shape(y_pred)[-1]
-        y_oh = tf.one_hot(y_true, n_cls)
-        pt = tf.reduce_sum(y_oh * y_pred, axis=-1)
-        return tf.pow(1.0 - pt, self.gamma) * (-tf.math.log(pt))
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        probs = torch.softmax(logits, dim=1)
+        probs = torch.clamp(probs, 1e-7, 1.0 - 1e-7)
 
-    def get_config(self):
-        cfg = super().get_config()
-        cfg["gamma"] = self.gamma
-        return cfg
+        y_oh = F.one_hot(targets, num_classes=probs.shape[1]).float()
+        pt = (y_oh * probs).sum(dim=1)
+
+        loss = (1.0 - pt) ** self.gamma * (-torch.log(pt))
+
+        if self.weight is not None:
+            w = self.weight[targets]
+            loss = loss * w
+
+        return loss.mean()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -111,27 +122,27 @@ LR_PHASE2 = 1e-5
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-_TF_MEAN = tf.constant([0.485, 0.456, 0.406], dtype=tf.float32)
-_TF_STD = tf.constant([0.229, 0.224, 0.225], dtype=tf.float32)
-
 random.seed(SEED)
 np.random.seed(SEED)
-tf.random.set_seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GPU
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-def setup_gpu():
-    gpus = tf.config.list_physical_devices("GPU")
-    if gpus:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        print(f"GPU: {len(gpus)} fizički GPU(s)")
+def setup_device() -> torch.device:
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        n = torch.cuda.device_count()
+        print(f"GPU: {n} fizički GPU(s) — {torch.cuda.get_device_name(0)}")
     else:
+        device = torch.device("cpu")
         print("GPU nije dostupan — CPU mod")
-    print(f"TensorFlow: {tf.__version__}")
+    print(f"PyTorch: {torch.__version__}")
+    return device
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -182,64 +193,16 @@ def print_distribution(labels_arr):
     print(f"  {'UKUPNO':15s}  {total:>10,}")
 
 
-data_augmentation = keras.Sequential(
-    [
-        layers.RandomFlip("horizontal"),
-        layers.RandomRotation(factor=10 / 360),
-        layers.RandomBrightness(factor=0.2),
-        layers.RandomContrast(factor=0.2),
-        layers.RandomZoom(height_factor=(-0.2, 0.0)),
-    ],
-    name="augmentation",
-)
-
-
-def preprocess_fn(path, label):
-    raw = tf.io.read_file(path)
-    img = tf.image.decode_image(raw, channels=3, expand_animations=False)
-    img = tf.cast(img, tf.float32)
-    img = tf.image.resize(img, [IMG_SIZE, IMG_SIZE])
-    img = img / 255.0
-    img = (img - _TF_MEAN) / _TF_STD
-    return img, label
-
-
-def build_tf_dataset(paths, labels, is_training: bool) -> tf.data.Dataset:
-    ds = tf.data.Dataset.from_tensor_slices((paths, labels))
-    if is_training:
-        ds = ds.shuffle(len(paths), seed=SEED, reshuffle_each_iteration=True)
-    ds = ds.map(preprocess_fn, num_parallel_calls=tf.data.AUTOTUNE)
-    ds = ds.batch(BATCH_SIZE)
-    if is_training:
-        ds = ds.map(
-            lambda x, y: (data_augmentation(x, training=True), y),
-            num_parallel_calls=tf.data.AUTOTUNE,
-        )
-    return ds.prefetch(tf.data.AUTOTUNE)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MODEL
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def build_model():
-    inputs = keras.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
-    backbone = keras.applications.EfficientNetB0(
-        include_top=False,
-        weights="imagenet",
-        input_shape=(IMG_SIZE, IMG_SIZE, 3),
+def build_dataloader(paths, labels, is_training: bool) -> DataLoader:
+    transform = get_train_transforms() if is_training else get_val_transforms()
+    dataset = FootballDataset(paths, list(labels), transform)
+    return DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=is_training,
+        num_workers=4,
+        pin_memory=torch.cuda.is_available(),
     )
-    backbone.trainable = False
-
-    x = backbone(inputs, training=False)
-    x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dense(256, activation="relu")(x)
-    x = layers.Dropout(0.5)(x)
-    out = layers.Dense(NUM_CLASSES, activation="softmax")(x)
-
-    model = keras.Model(inputs, out, name="soccer_classifier")
-    return model, backbone
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -247,71 +210,112 @@ def build_model():
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-def get_callbacks(phase: int) -> list:
-    return [
-        keras.callbacks.EarlyStopping(
-            monitor="val_loss",
-            patience=3 if phase == 1 else 5,
-            restore_best_weights=True,
-            verbose=1,
-        ),
-        keras.callbacks.ModelCheckpoint(
-            str(OUTPUT_DIR / "best_model.keras"),
-            monitor="val_loss",
-            save_best_only=True,
-            verbose=1,
-        ),
-        keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss", factor=0.5, patience=2, min_lr=1e-7, verbose=1
-        ),
-    ]
+def _run_epoch(model, loader, criterion, optimizer, device, training: bool):
+    """Run one epoch; returns (avg_loss, accuracy)."""
+    model.train() if training else model.eval()
+    total_loss, correct, total = 0.0, 0, 0
+
+    ctx = torch.enable_grad() if training else torch.no_grad()
+    with ctx:
+        for imgs, lbls in loader:
+            imgs = imgs.to(device)
+            lbls = torch.tensor(lbls, dtype=torch.long).to(device) if not isinstance(lbls, torch.Tensor) else lbls.to(device)
+
+            if training:
+                optimizer.zero_grad()
+
+            logits = model(imgs)
+            loss = criterion(logits, lbls)
+
+            if training:
+                loss.backward()
+                optimizer.step()
+
+            total_loss += loss.item() * len(lbls)
+            correct += (logits.argmax(1) == lbls).sum().item()
+            total += len(lbls)
+
+    return total_loss / total, correct / total
 
 
-def phase1(model, train_ds, val_ds, class_weights, epochs=EPOCHS_P1):
+def _train_phase(model, train_loader, val_loader, criterion, optimizer, device,
+                 epochs, patience, phase):
+    """Generic training loop with early stopping + ReduceLROnPlateau."""
+    scheduler = ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-7
+    )
+    best_val_loss = float("inf")
+    no_improve = 0
+    history = {"loss": [], "val_loss": [], "accuracy": [], "val_accuracy": []}
+
+    for epoch in range(1, epochs + 1):
+        train_loss, train_acc = _run_epoch(
+            model, train_loader, criterion, optimizer, device, training=True
+        )
+        val_loss, val_acc = _run_epoch(
+            model, val_loader, criterion, None, device, training=False
+        )
+        scheduler.step(val_loss)
+
+        history["loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["accuracy"].append(train_acc)
+        history["val_accuracy"].append(val_acc)
+
+        lr_now = optimizer.param_groups[0]["lr"]
+        print(
+            f"  Epoha {epoch:3d}/{epochs} — "
+            f"loss: {train_loss:.4f}  acc: {train_acc:.4f}  "
+            f"val_loss: {val_loss:.4f}  val_acc: {val_acc:.4f}  "
+            f"lr: {lr_now:.2e}"
+        )
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            no_improve = 0
+            torch.save(model.state_dict(), str(OUTPUT_DIR / "best_model.pt"))
+            print(f"    ✓ Novi best model sačuvan (val_loss: {val_loss:.4f})")
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                print(f"    Early stopping (patience={patience})")
+                break
+
+    # Restore best weights
+    model.load_state_dict(
+        torch.load(str(OUTPUT_DIR / "best_model.pt"), weights_only=True)
+    )
+    return history
+
+
+def phase1(model, train_loader, val_loader, criterion, device, epochs=EPOCHS_P1):
     print("\n" + "=" * 55)
     print("FAZA 1 — Trening klasifikatora (frozen backbone)")
     print("  Loss: Focal Loss (γ=2.0) — redukuje false positive")
     print("=" * 55)
-    model.compile(
-        optimizer=keras.optimizers.Adam(LR_PHASE1),
-        loss=FocalLoss(gamma=2.0),
-        metrics=["accuracy"],
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()), lr=LR_PHASE1
     )
-    return model.fit(
-        train_ds,
-        validation_data=val_ds,
-        epochs=epochs,
-        class_weight=class_weights,
-        callbacks=get_callbacks(1),
+    return _train_phase(
+        model, train_loader, val_loader, criterion, optimizer, device,
+        epochs, patience=3, phase=1
     )
 
 
-def phase2(model, backbone, train_ds, val_ds, class_weights, epochs=EPOCHS_P2):
+def phase2(model, train_loader, val_loader, criterion, device, epochs=EPOCHS_P2):
     print("\n" + "=" * 55)
     print("FAZA 2 — Fine-tuning (block5+ odmrznut)")
     print("  Loss: Focal Loss (γ=2.0) — redukuje false positive")
     print("=" * 55)
-    backbone.trainable = True
-    started = False
-    for layer in backbone.layers:
-        if "block5" in layer.name:
-            started = True
-        layer.trainable = started
-
-    model.compile(
-        optimizer=keras.optimizers.Adam(LR_PHASE2),
-        loss=FocalLoss(gamma=2.0),
-        metrics=["accuracy"],
+    model.unfreeze_from_block5()
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trenabilni parametri: {trainable:,}")
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()), lr=LR_PHASE2
     )
-    print(
-        f"Trenabilni parametri: {sum(np.prod(v.shape) for v in model.trainable_variables):,}"
-    )
-    return model.fit(
-        train_ds,
-        validation_data=val_ds,
-        epochs=epochs,
-        class_weight=class_weights,
-        callbacks=get_callbacks(2),
+    return _train_phase(
+        model, train_loader, val_loader, criterion, optimizer, device,
+        epochs, patience=5, phase=2
     )
 
 
@@ -320,13 +324,19 @@ def phase2(model, backbone, train_ds, val_ds, class_weights, epochs=EPOCHS_P2):
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-def evaluate(model, test_ds):
+def evaluate(model, test_loader, device):
+    model.eval()
     y_true, y_pred, y_prob = [], [], []
-    for imgs, lbls in tqdm(test_ds, desc="Evaluacija"):
-        probs = model.predict(imgs, verbose=0)
-        y_true.extend(lbls.numpy())
-        y_pred.extend(np.argmax(probs, 1))
-        y_prob.extend(probs)
+
+    with torch.no_grad():
+        for imgs, lbls in tqdm(test_loader, desc="Evaluacija"):
+            imgs = imgs.to(device)
+            lbls = lbls.to(device) if isinstance(lbls, torch.Tensor) else torch.tensor(lbls).to(device)
+            probs = torch.softmax(model(imgs), dim=1).cpu().numpy()
+            y_true.extend(lbls.cpu().numpy())
+            y_pred.extend(np.argmax(probs, 1))
+            y_prob.extend(probs)
+
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
     y_prob = np.array(y_prob)
@@ -393,18 +403,18 @@ def print_results(y_true, y_pred):
 
 
 def plot_training_history(h1, h2):
-    p1_n = len(h1.history["loss"])
-    loss = h1.history["loss"] + h2.history["loss"]
-    vloss = h1.history["val_loss"] + h2.history["val_loss"]
-    acc = h1.history["accuracy"] + h2.history["accuracy"]
-    vacc = h1.history["val_accuracy"] + h2.history["val_accuracy"]
+    p1_n = len(h1["loss"])
+    loss = h1["loss"] + h2["loss"]
+    vloss = h1["val_loss"] + h2["val_loss"]
+    acc = h1["accuracy"] + h2["accuracy"]
+    vacc = h1["val_accuracy"] + h2["val_accuracy"]
     ep = list(range(1, len(loss) + 1))
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     fig.suptitle("Istorija treniranja", fontsize=14, fontweight="bold")
 
     for ax, train, val, title, ylabel in [
-        (axes[0], loss, vloss, "Loss (Cross-Entropy)", "Loss"),
+        (axes[0], loss, vloss, "Loss (Focal Loss)", "Loss"),
         (axes[1], acc, vacc, "Accuracy", "Accuracy"),
     ]:
         ax.plot(ep, train, "b-o", ms=4, lw=2, label="Train")
@@ -549,62 +559,71 @@ def plot_class_distribution(labels_arr):
 
 
 class GradCAM:
-    def __init__(self, model, backbone):
-        target = self._find_target_layer(backbone)
-        print(f"GradCAM target: {target.name}")
+    """
+    Grad-CAM using forward/backward hooks on the last conv block of EfficientNet
+    (model.features[-1], i.e. features[8] = top Conv2dNormActivation).
+    """
 
-        self.backbone_grad_model = keras.Model(
-            inputs=backbone.inputs, outputs=[target.output, backbone.output]
-        )
+    def __init__(self, model: FootballActionRecognizer):
+        self.model = model
+        self._activations = None
+        self._gradients = None
 
-        # Head slojevi iz kompletnog modela (posle backbone-a)
-        self.gap = model.get_layer("global_average_pooling2d")
-        self.dense1 = model.get_layer("dense")
-        self.dropout = model.get_layer("dropout")
-        self.dense2 = model.get_layer("dense_1")
+        target_layer = model.features[-1]
+        self._fwd_hook = target_layer.register_forward_hook(self._save_activation)
+        self._bwd_hook = target_layer.register_full_backward_hook(self._save_gradient)
 
-    @staticmethod
-    def _find_target_layer(backbone):
-        for name in ["top_activation", "top_conv", "block7a_project_bn", "block6d_add"]:
-            try:
-                return backbone.get_layer(name)
-            except ValueError:
-                continue
-        for layer in reversed(backbone.layers):
-            try:
-                if len(layer.output.shape) == 4:
-                    return layer
-            except Exception:
-                continue
-        raise ValueError("Nije pronađen konvolucioni sloj za GradCAM")
+    def _save_activation(self, module, inp, out):
+        self._activations = out.detach()
 
-    def compute(self, img_batch, class_idx=None):
-        img = tf.cast(img_batch, tf.float32)
+    def _save_gradient(self, module, grad_in, grad_out):
+        self._gradients = grad_out[0].detach()
 
-        with tf.GradientTape() as tape:
-            conv_out, backbone_out = self.backbone_grad_model(img, training=False)
-            tape.watch(conv_out)
+    def compute(self, img_tensor: torch.Tensor, class_idx: int = None):
+        """
+        img_tensor: (1, C, H, W) normalized tensor on the correct device.
+        Returns: (heatmap np.ndarray H×W in [0,1], class_idx, confidence float)
+        """
+        self.model.eval()
+        img_tensor = img_tensor.clone().requires_grad_(False)
 
-            x = self.gap(backbone_out)
-            x = self.dense1(x)
-            x = self.dropout(x, training=False)
-            preds = self.dense2(x)
+        # Forward
+        logits = self.model(img_tensor)
+        probs = torch.softmax(logits, dim=1)
 
-            if class_idx is None:
-                class_idx = int(tf.argmax(preds[0]))
-            score = preds[:, class_idx]
+        if class_idx is None:
+            class_idx = int(torch.argmax(probs[0]))
 
-        grads = tape.gradient(score, conv_out)[0]
-        alpha = tf.reduce_mean(grads, axis=(0, 1))
-        cam = tf.maximum(tf.reduce_sum(alpha * conv_out[0], axis=-1), 0)
-        cam = (cam / (tf.reduce_max(cam) + 1e-8)).numpy()
+        # Backward
+        self.model.zero_grad()
+        logits[0, class_idx].backward()
+
+        # Grad-CAM
+        acts = self._activations[0]   # (C, H, W)
+        grads = self._gradients[0]    # (C, H, W)
+
+        alpha = grads.mean(dim=(1, 2), keepdim=True)  # (C, 1, 1)
+        cam = torch.relu((alpha * acts).sum(dim=0))   # (H, W)
+        cam = cam.cpu().numpy()
+        cam = cam / (cam.max() + 1e-8)
         heatmap = cv2.resize(cam, (IMG_SIZE, IMG_SIZE))
-        return heatmap, class_idx, float(preds[0, class_idx])
 
-    def overlay(self, orig, heatmap, alpha=0.4):
+        return heatmap, class_idx, float(probs[0, class_idx].detach())
+
+    def overlay(self, orig: np.ndarray, heatmap: np.ndarray, alpha: float = 0.4):
         h = cv2.applyColorMap(np.uint8(255 * heatmap), cv2.COLORMAP_JET)
         h = cv2.cvtColor(h, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         return np.clip(np.clip(orig, 0, 1) * (1 - alpha) + h * alpha, 0, 1)
+
+    def remove_hooks(self):
+        self._fwd_hook.remove()
+        self._bwd_hook.remove()
+
+
+def _load_image_numpy(path: str) -> np.ndarray:
+    """Load image as HWC float32 array in [0, 1] at IMG_SIZE×IMG_SIZE."""
+    img = Image.open(path).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
+    return np.array(img, dtype=np.float32) / 255.0
 
 
 def plot_false_positives(test_paths, y_true, y_pred, y_prob, n_examples=8):
@@ -644,13 +663,9 @@ def plot_false_positives(test_paths, y_true, y_pred, y_prob, n_examples=8):
         true_name = IDX_TO_LABEL[true_cls]
         pred_name = IDX_TO_LABEL[pred_cls]
 
-        # from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-
         ax_img = ax.inset_axes([0, 0.45, 1, 0.55])
-        raw = tf.io.read_file(test_paths[idx])
-        img = tf.image.decode_image(raw, channels=3, expand_animations=False)
-        img = tf.image.resize(tf.cast(img, tf.float32), [IMG_SIZE, IMG_SIZE])
-        ax_img.imshow(np.clip(img.numpy() / 255.0, 0, 1))
+        img_01 = _load_image_numpy(test_paths[idx])
+        ax_img.imshow(np.clip(img_01, 0, 1))
         ax_img.axis("off")
 
         ax.text(
@@ -745,7 +760,7 @@ def plot_false_positives(test_paths, y_true, y_pred, y_prob, n_examples=8):
         print(f"  {IDX_TO_LABEL[t]:15s} → {IDX_TO_LABEL[p_]:15s}  {cnt:>5}")
 
 
-def plot_gradcam(gradcam, test_paths, y_true, y_pred, n=3):
+def plot_gradcam(gradcam: GradCAM, test_paths, y_true, y_pred, device, n=3):
     per_class = {}
     for i, (t, p) in enumerate(zip(y_true, y_pred)):
         if t == p:
@@ -754,6 +769,14 @@ def plot_gradcam(gradcam, test_paths, y_true, y_pred, n=3):
     n_cols = n * 2
     fig, axes = plt.subplots(NUM_CLASSES, n_cols, figsize=(n_cols * 3, NUM_CLASSES * 3))
     fig.suptitle('Grad-CAM — Šta model "gleda"', fontsize=13, fontweight="bold")
+
+    val_transform = T.Compose(
+        [
+            T.Resize((IMG_SIZE, IMG_SIZE)),
+            T.ToTensor(),
+            T.Normalize(mean=list(IMAGENET_MEAN), std=list(IMAGENET_STD)),
+        ]
+    )
 
     for row, cls in enumerate(range(NUM_CLASSES)):
         axes[row][0].set_ylabel(
@@ -764,15 +787,11 @@ def plot_gradcam(gradcam, test_paths, y_true, y_pred, n=3):
         )
 
         for col_pair, idx in enumerate(idxs):
-            raw = tf.io.read_file(test_paths[idx])
-            img = tf.image.decode_image(raw, channels=3, expand_animations=False)
-            img_255 = tf.image.resize(
-                tf.cast(img, tf.float32), [IMG_SIZE, IMG_SIZE]
-            ).numpy()
-            img_01 = img_255 / 255.0
+            img_01 = _load_image_numpy(test_paths[idx])
+            pil_img = Image.fromarray(np.uint8(img_01 * 255))
+            img_tensor = val_transform(pil_img).unsqueeze(0).to(device)
 
-            img_norm = (img_01 - IMAGENET_MEAN) / IMAGENET_STD
-            heatmap, _, conf = gradcam.compute(img_norm[None], class_idx=cls)
+            heatmap, _, conf = gradcam.compute(img_tensor, class_idx=cls)
             ov = gradcam.overlay(img_01, heatmap)
 
             axes[row][col_pair * 2].imshow(np.clip(img_01, 0, 1))
@@ -827,7 +846,7 @@ def compute_baseline(y_train, y_test, model_acc, model_f1):
     print(f"  {'EfficientNetB0 (naš)':30s} {model_acc * 100:>8.2f}% {model_f1:>8.4f}")
     print("=" * 60)
 
-    models = ["Majority\nclass", "Random", "EfficientNetB0\n(naš)"]
+    models_labels = ["Majority\nclass", "Random", "EfficientNetB0\n(naš)"]
     accs = [acc_maj * 100, acc_rnd * 100, model_acc * 100]
     f1s = [f1_maj, f1_rnd, model_f1]
     clrs = ["#95a5a6", "#bdc3c7", "#2ecc71"]
@@ -838,7 +857,7 @@ def compute_baseline(y_train, y_test, model_acc, model_f1):
         (axes[0], accs, "Accuracy (%)", 75, "Cilj 75%"),
         (axes[1], f1s, "Weighted F1", 0.72, "Cilj 0.72"),
     ]:
-        bars = ax.bar(models, vals, color=clrs, edgecolor="white")
+        bars = ax.bar(models_labels, vals, color=clrs, edgecolor="white")
         ax.axhline(target, color="red", ls="--", label=target_lbl)
         for bar, v in zip(bars, vals):
             ax.text(
@@ -866,7 +885,7 @@ def compute_baseline(y_train, y_test, model_acc, model_f1):
 
 
 def main(quick: bool = False, sample_pct: int = 100):
-    setup_gpu()
+    device = setup_device()
 
     if quick:
         pct = 5
@@ -915,34 +934,42 @@ def main(quick: bool = False, sample_pct: int = 100):
     for idx, (raw, adj) in zip(np.unique(y_train), zip(cw_raw, cw_arr)):
         print(f"  {IDX_TO_LABEL[int(idx)]:15s}  {raw:>13.4f}  {adj:>16.4f}")
 
-    # ── 4. Datasetovi ─────────────────────────────────────────────────────────
-    print("\n[3/7] Kreiranje tf.data pipeline-a...")
-    train_ds = build_tf_dataset(X_train, y_train, is_training=True)
-    val_ds = build_tf_dataset(X_val, y_val, is_training=False)
-    test_ds = build_tf_dataset(X_test, y_test, is_training=False)
+    cw_tensor = torch.tensor(
+        [cw_dict[i] for i in range(NUM_CLASSES)], dtype=torch.float32
+    ).to(device)
+
+    # ── 4. DataLoaderi ────────────────────────────────────────────────────────
+    print("\n[3/7] Kreiranje DataLoader pipeline-a...")
+    train_loader = build_dataloader(X_train, y_train, is_training=True)
+    val_loader = build_dataloader(X_val, y_val, is_training=False)
+    test_loader = build_dataloader(X_test, y_test, is_training=False)
 
     # ── 5. Model ──────────────────────────────────────────────────────────────
     print("\n[4/7] Izgradnja modela...")
-    model, backbone = build_model()
-    total = model.count_params()
-    train_p = sum(np.prod(v.shape) for v in model.trainable_variables)
+    model = FootballActionRecognizer(num_classes=NUM_CLASSES).to(device)
+    total = sum(p.numel() for p in model.parameters())
+    train_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Ukupno parametara:    {total:,}")
     print(f"  Trenabilni (Faza 1):  {train_p:,}")
-    if not quick:
-        model.summary(line_length=80)
+
+    criterion = FocalLoss(gamma=2.0, weight=cw_tensor)
 
     # ── 6. Treniranje ─────────────────────────────────────────────────────────
     print("\n[5/7] Treniranje...")
-    h1 = phase1(model, train_ds, val_ds, cw_dict, epochs=ep1)
-    h2 = phase2(model, backbone, train_ds, val_ds, cw_dict, epochs=ep2)
+    h1 = phase1(model, train_loader, val_loader, criterion, device, epochs=ep1)
+    h2 = phase2(model, train_loader, val_loader, criterion, device, epochs=ep2)
     plot_training_history(h1, h2)
 
     # ── 7. Evaluacija ─────────────────────────────────────────────────────────
     print("\n[6/7] Evaluacija...")
-    best = keras.models.load_model(
-        str(OUTPUT_DIR / "best_model.keras"), custom_objects={"FocalLoss": FocalLoss}
+    best = FootballActionRecognizer(num_classes=NUM_CLASSES)
+    best.load_state_dict(
+        torch.load(str(OUTPUT_DIR / "best_model.pt"), weights_only=True)
     )
-    y_true, y_pred, y_prob = evaluate(best, test_ds)
+    best = best.to(device)
+    best.eval()
+
+    y_true, y_pred, y_prob = evaluate(best, test_loader, device)
     acc, f1_w, f1_per = print_results(y_true, y_pred)
 
     plot_confusion_matrix(y_true, y_pred)
@@ -951,9 +978,9 @@ def main(quick: bool = False, sample_pct: int = 100):
 
     # ── Grad-CAM ──────────────────────────────────────────────────────────────
     print("\n[7/7] Grad-CAM vizualizacija...")
-    best_backbone = best.get_layer("efficientnetb0")
-    gradcam = GradCAM(best, best_backbone)
-    plot_gradcam(gradcam, X_test, y_true, y_pred, n=3)
+    gradcam = GradCAM(best)
+    plot_gradcam(gradcam, X_test, y_true, y_pred, device, n=3)
+    gradcam.remove_hooks()
 
     # ── Baseline ──────────────────────────────────────────────────────────────
     acc_maj, f1_maj, acc_rnd, f1_rnd = compute_baseline(y_train, y_test, acc, f1_w)
@@ -963,7 +990,7 @@ def main(quick: bool = False, sample_pct: int = 100):
         "model": {
             "backbone": "EfficientNetB0",
             "num_classes": NUM_CLASSES,
-            "total_params": int(best.count_params()),
+            "total_params": int(sum(p.numel() for p in best.parameters())),
         },
         "dataset": {
             "total": len(paths),
@@ -1004,7 +1031,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--quick",
         action="store_true",
-        help="10%% podataka, 2 epohe — brzi test (~10 min)",
+        help="5%% podataka, 2+1 epohe — brzi test (~5 min)",
     )
     parser.add_argument(
         "--sample",
